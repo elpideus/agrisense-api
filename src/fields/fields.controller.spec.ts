@@ -1,0 +1,20 @@
+import { FieldsService } from './fields.service';
+import { Test, TestingModule } from '@nestjs/testing';
+import { FieldsController } from './fields.controller';
+
+describe('FieldsController', () => {
+  let controller: FieldsController;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [{ provide: FieldsService, useValue: {} }],
+      controllers: [FieldsController],
+    }).compile();
+
+    controller = module.get<FieldsController>(FieldsController);
+  });
+
+  it('should be defined', () => {
+    expect(controller).toBeDefined();
+  });
+});

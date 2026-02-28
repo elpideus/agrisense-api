@@ -1,0 +1,33 @@
+name: agrisense
+
+include:
+  - supabase/docker/docker-compose.yml
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT}:${PORT}"
+    environment:
+      # URLs are constructed from the component POSTGRES_* / POOLER_* vars in .env.
+      # Inside Docker, supavisor and db are internal service names — never exposed to the host.
+      - DATABASE_URL=postgresql://supabase_admin.${POOLER_TENANT_ID}:${POSTGRES_PASSWORD}@supavisor:5432/${POSTGRES_DB}
+      - DIRECT_URL=postgresql://supabase_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      - PORT=${PORT}
+      - SEED=${SEED}
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+    depends_on:
+      supavisor:
+        condition: service_started
+      db:
+        condition: service_healthy
+
+networks:
+  # The private network is defined (and named) by supabase/docker/docker-compose.yml.
+  # We reference it here as external so the API container can join it.
+  agrisense_internal:
+    name: ${DOCKER_NETWORK_NAME}
+    external: true

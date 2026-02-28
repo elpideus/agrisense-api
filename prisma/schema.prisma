@@ -1,0 +1,304 @@
+// =============================================================================
+// Agrisense — Prisma Schema
+// Target: Supabase (PostgreSQL + PostGIS)
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [postgis]
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum DeviceType {
+  MASTER
+  SLAVE
+}
+
+enum UpdateInterval {
+  LOW // Every 25 min — stable conditions, battery saving
+  NORMAL // Every 5 min  — default operating mode
+  HIGH // Every 1 min  — critical conditions (frost risk)
+}
+
+enum ReportStatus {
+  OPEN // Issue ongoing, treatment in progress
+  CLOSED // Plant cured, report archived
+}
+
+enum ProblemCategory {
+  DISEASE // Fungal, bacterial, or viral conditions
+  PEST // Insect or animal infestations
+  ABIOTIC // Non-biological stress (frost, nutrient deficiency)
+  OTHER
+}
+
+enum Progression {
+  IMPROVING
+  STABLE
+  WORSENING
+}
+
+// =============================================================================
+// MODELS
+// =============================================================================
+
+model User {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  created_at DateTime @default(now())
+  name       String
+  email      String   @unique
+  password   String // bcrypt hash — never plain text
+  phone      String?
+
+  fields  Field[]
+  devices Device[]
+  images  Image[]
+}
+
+model Image {
+  id          String   @id @default(uuid()) @db.Uuid
+  created_at  DateTime @default(now())
+  url         String
+  storage_key String   @unique
+
+  user_id   String  @db.Uuid
+  report_id String? @db.Uuid
+  note_id   String? @db.Uuid
+
+  user   User        @relation(fields: [user_id], references: [id])
+  report Report?     @relation(fields: [report_id], references: [id])
+  note   ReportNote? @relation(fields: [note_id], references: [id])
+
+  @@index([user_id])
+}
+
+model Field {
+  id         String                                @id @default(uuid()) @db.Uuid
+  created_at DateTime                              @default(now())
+  name       String
+  // PostGIS geography point — enable the postgis extension in Supabase
+  gps_coords Unsupported("geography(Point, 4326)")
+  is_bio     Boolean                               @default(false)
+
+  user_id String @db.Uuid
+  user    User   @relation(fields: [user_id], references: [id])
+
+  crops    Crop[]
+  devices  Device[]
+  reports  Report[]
+  harvests Harvest[]
+
+  @@index([user_id])
+}
+
+model Species {
+  id              String   @id @default(uuid()) @db.Uuid
+  created_at      DateTime @default(now())
+  common_name     String
+  scientific_name String   @unique
+
+  varieties Variety[]
+  problems  ProblemSpecies[]
+}
+
+model Variety {
+  id         String   @id @default(uuid()) @db.Uuid
+  created_at DateTime @default(now())
+  name       String
+
+  species_id String  @db.Uuid
+  species    Species @relation(fields: [species_id], references: [id])
+
+  bloom_stages BloomStage[]
+  crops        Crop[]
+}
+
+model BloomStage {
+  id           String @id @default(uuid()) @db.Uuid
+  name         String
+  number       Int // Sequential order starting at 1
+  // Frost thresholds (TBU — Temperature Bloom Units)
+  // CHECK constraint: crit_temp_90 < crit_temp_10 (enforce via raw migration)
+  crit_temp_10 Float // 10% flower kill threshold (early warning)
+  crit_temp_90 Float // 90% flower kill threshold (critical)
+
+  variety_id String  @db.Uuid
+  variety    Variety @relation(fields: [variety_id], references: [id])
+
+  crops Crop[] @relation("CurrentBloomStage")
+}
+
+model Crop {
+  id         String    @id @default(uuid()) @db.Uuid
+  created_at DateTime  @default(now())
+  planted_at DateTime?
+
+  field_id               String  @db.Uuid
+  variety_id             String  @db.Uuid
+  // Which bloom stage this specific crop instance has currently reached
+  current_bloom_stage_id String? @db.Uuid
+
+  field               Field       @relation(fields: [field_id], references: [id])
+  variety             Variety     @relation(fields: [variety_id], references: [id])
+  current_bloom_stage BloomStage? @relation("CurrentBloomStage", fields: [current_bloom_stage_id], references: [id])
+
+  reports  ReportCrop[]
+  harvests Harvest[]
+
+  @@index([field_id])
+}
+
+model Problem {
+  id          String          @id @default(uuid()) @db.Uuid
+  created_at  DateTime        @default(now())
+  name        String          @unique
+  category    ProblemCategory
+  description String?
+
+  species ProblemSpecies[]
+  reports Report[]
+}
+
+model Device {
+  mac             String         @id @db.Char(17) // e.g. "A1:B2:C3:D4:E5:F6"
+  created_at      DateTime       @default(now())
+  name            String
+  device_type     DeviceType
+  // MASTER only: is the irrigation pump currently running?
+  is_active       Boolean        @default(false)
+  // SLAVE only: current polling frequency
+  update_interval UpdateInterval @default(NORMAL)
+  is_sold         Boolean        @default(false)
+
+  user_id    String  @db.Uuid
+  field_id   String? @db.Uuid
+  // SLAVE only: MAC address of the master this slave reports to
+  master_mac String? @db.Char(17)
+
+  user   User     @relation(fields: [user_id], references: [id])
+  field  Field?   @relation(fields: [field_id], references: [id])
+  master Device?  @relation("MasterSlave", fields: [master_mac], references: [mac])
+  slaves Device[] @relation("MasterSlave")
+
+  readings Reading[]
+
+  @@index([field_id])
+}
+
+model Reading {
+  id         String   @id @default(uuid()) @db.Uuid
+  created_at DateTime @default(now())
+
+  device_mac    String         @db.Char(17)
+  temperature   Float // °C
+  humidity      Float // Relative humidity %
+  pressure      Float // hPa
+  battery_value Int // 0–100 %
+  // Temperature Bloom Units — accumulated heat metric for frost risk calc
+  tbu           Float
+  state         UpdateInterval
+  // Bitmask: 0=OK, 1=temp/humidity sensor fail, 2=pressure sensor fail,
+  //          4=out-of-bounds reading, 8=battery below 15%
+  error_code    Int            @default(0)
+  // LoRa signal strength (negative dBm; closer to 0 = stronger)
+  rssi          Int
+
+  device Device @relation(fields: [device_mac], references: [mac])
+
+  @@index([device_mac])
+  @@index([created_at])
+}
+
+model Report {
+  id          String       @id @default(uuid()) @db.Uuid
+  created_at  DateTime     @default(now())
+  closed_at   DateTime?
+  status      ReportStatus @default(OPEN)
+  title       String
+  description String?
+
+  problem_id String @db.Uuid
+  field_id   String @db.Uuid
+
+  problem Problem @relation(fields: [problem_id], references: [id])
+  field   Field   @relation(fields: [field_id], references: [id])
+
+  crops  ReportCrop[]
+  notes  ReportNote[]
+  images Image[]
+
+  @@index([field_id])
+  @@index([created_at])
+  @@index([field_id, created_at]) // Composite index for annual dashboard query
+}
+
+model ReportNote {
+  id              String       @id @default(uuid()) @db.Uuid
+  created_at      DateTime     @default(now())
+  content         String
+  progression     Progression?
+  product_applied String?
+  dosage          String?
+
+  report_id String @db.Uuid
+  report    Report @relation(fields: [report_id], references: [id])
+
+  images Image[]
+
+  @@index([report_id])
+}
+
+model Harvest {
+  id           String   @id @default(uuid()) @db.Uuid
+  created_at   DateTime @default(now())
+  harvested_at DateTime
+
+  crop_id  String @db.Uuid
+  field_id String @db.Uuid // Denormalized from crop.field_id for easier querying
+
+  total          Int
+  first_quality  Int     @default(0)
+  second_quality Int     @default(0)
+  garbage        Int     @default(0)
+  notes          String?
+
+  crop  Crop  @relation(fields: [crop_id], references: [id])
+  field Field @relation(fields: [field_id], references: [id])
+
+  // Application constraint: first_quality + second_quality + garbage = total
+  // Add this CHECK constraint via a raw SQL migration:
+  // ALTER TABLE "Harvest" ADD CONSTRAINT harvest_quality_sum_check
+  //   CHECK (first_quality + second_quality + garbage = total);
+}
+
+// =============================================================================
+// JOIN TABLES
+// =============================================================================
+
+model ReportCrop {
+  report_id String @db.Uuid
+  crop_id   String @db.Uuid
+
+  report Report @relation(fields: [report_id], references: [id])
+  crop   Crop   @relation(fields: [crop_id], references: [id])
+
+  @@id([report_id, crop_id])
+}
+
+model ProblemSpecies {
+  problem_id String @db.Uuid
+  species_id String @db.Uuid
+
+  problem Problem @relation(fields: [problem_id], references: [id])
+  species Species @relation(fields: [species_id], references: [id])
+
+  @@id([problem_id, species_id])
+}
